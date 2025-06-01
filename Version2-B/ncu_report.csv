@@ -1,0 +1,10 @@
+==PROF== Connected to process 52962 (/root/Project_Test2/test_vedio)
+
+==ERROR== Profiling failed because a driver resource was unavailable or the user does not have permission to access NVIDIA GPU Performance Counters. Ensure that no other tool (like DCGM) is concurrently collecting profiling data. For instructions on enabling permissions, see https://developer.nvidia.com/ERR_NVGPUCTRPERM. See https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq for more details.
+
+==ERROR== Profiling failed because a driver resource was unavailable or the user does not have permission to access NVIDIA GPU Performance Counters. Ensure that no other tool (like DCGM) is concurrently collecting profiling data. For instructions on enabling permissions, see https://developer.nvidia.com/ERR_NVGPUCTRPERM. See https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq for more details.
+==ERROR== Failed to profile "gaussianBlurGlobal" in process 52962
+==PROF== Trying to shutdown target application
+==ERROR== The application returned an error code (9).
+==ERROR== An error occurred while trying to profile.
+==WARNING== No kernels were profiled.
