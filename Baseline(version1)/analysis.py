@@ -4,6 +4,13 @@ from datetime import datetime
 
 # 1. 讀取 timing.csv
 timing = pd.read_csv('timing.csv')
+
+timing['elapsed_page_h2d_ms'] = timing['elapsed_page_h2d_ms'].fillna(0)
+timing['elapsed_page_d2h_ms'] = timing['elapsed_page_d2h_ms'].fillna(0)
+timing['elapsed_pin_h2d_ms'] = timing['elapsed_pin_h2d_ms'].fillna(0)
+timing['elapsed_pin_d2h_ms'] = timing['elapsed_pin_d2h_ms'].fillna(0)
+timing['elapsed_kernels_ms'] = timing['elapsed_kernels_ms'].fillna(0)
+
 timing['total_time_ms'] = (
     timing['elapsed_page_h2d_ms'] +
     timing['elapsed_pin_h2d_ms'] +

@@ -2,7 +2,7 @@ NCU report 資料有誤或欄位不存在，無法繪製 Memory/Occupancy/Instru
 ===== Summary Metrics =====
 Total Execution Time (ms): 9511.198
 Avg Execution Time per Frame (ms): 1.7629653382761816
-Avg PCIe Bandwidths (MB/s): {'bw_page_h2d_MBps': 932.5553857275255, 'bw_pin_h2d_MBps': 1573.5364774791474, 'bw_page_d2h_MBps': 783.2024548656163, 'bw_pin_d2h_MBps': 1574.8185679332717}
-Average Power (W): 3.578706293706294
-Total Energy (Wh): 0.28786355416666665
-Power Efficiency (frames per Joule): 5.205977239631553
+Avg PCIe Bandwidths (MB/s): {'bw_page_h2d_MBps': nan, 'bw_pin_h2d_MBps': nan, 'bw_page_d2h_MBps': nan, 'bw_pin_d2h_MBps': nan}
+Average Power (W): 4.136691449814126
+Total Energy (Wh): 0.3087179583333333
+Power Efficiency (frames per Joule): 4.854304942937623
