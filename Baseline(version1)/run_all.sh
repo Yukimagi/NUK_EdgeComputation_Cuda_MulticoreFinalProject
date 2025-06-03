@@ -17,15 +17,10 @@ kill $GPU_MONITOR_PID
 #    pgrep -f "nvidia-smi --query-gpu" && killall nvidia-smi
 
 # 6. 等功耗監測停了，再啟動 ncu 去做 Profiling（把結果存在 ncu_report.csv）
-ncu --csv --metrics \
-    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
-    l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,\
-    l2__throughput.avg.pct_of_peak_sustained_elapsed,\
-    sm__warps_active.avg.pct_of_peak_sustained_elapsed,\
-    sm__avg_active_warps_per_active_cycle,\
-    sm__inst_issued.avg.per_cycle_active \
-    ./test_vedio input.mp4 \
-    > ncu_report.csv
+#sudo ncu --csv --target-processes all --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,l2__throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_elapsed,sm__avg_active_warps_per_active_cycle,sm__inst_issued.avg.per_cycle_active ./test_vedio input.mp4 > ncu_report.csv
+
+
+
 
 echo "All done.
 - output.mp4 (CUDA 處理過的影片)

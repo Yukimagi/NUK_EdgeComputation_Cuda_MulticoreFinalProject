@@ -1,12 +1,36 @@
+// test_vedio_simple.cu
+//
+// 純版本 A 風格：
+// - 拆 input.mp4 → frames/frame_XXXXXX.png
+// - 逐幀讀入灰階 PNG，用同步 cudaMemcpy + 兩個 kernel (Gaussian → Sobel)
+// - 僅測量 kernel 耗時，其它 H2D/D2H 寫入 N/A
+// - 寫入 timing.csv：若本版本不測某階段，則填 "N/A"
+// - 處理後輸出到 processed/processed_XXXXXX.png
+// - 最後合成 processed/*.png → output.mp4
+//
+// 編譯：
+//   nvcc -std=c++11 test_vedio_simple.cu -o test_vedio_simple
+//
+// 執行：
+//   ./test_vedio_simple input.mp4
+//
+// 產出：
+//   - frames/frame_000001.png, frame_000002.png, …
+//   - processed/processed_000001.png, processed/processed_000002.png, …
+//   - timing.csv
+//   - output.mp4
+//
+
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>    // 用來檢查檔案是否存在
+#include <sys/stat.h>    // 用來檢查路徑是否存在
 #include <sys/types.h>
 #include <unistd.h>
-#include <fstream>       // C++ 檔案輸出
+#include <fstream>       // 用於輸出 CSV
 #include <iomanip>       // 控制浮點格式
+#include <errno.h>       // errno
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"        // header-only image loader
@@ -14,7 +38,7 @@
 #include "stb_image_write.h"  // header-only image writer
 
 // ----------------------------------------------
-// 5×5 高斯核（已歸一化）
+// 5×5 高斯核（已歸一化），放到 constant memory
 static __constant__ float gaussKernel[25] = {
     1/256.f,  4/256.f,  6/256.f,  4/256.f, 1/256.f,
     4/256.f, 16/256.f, 24/256.f, 16/256.f, 4/256.f,
@@ -23,28 +47,36 @@ static __constant__ float gaussKernel[25] = {
     1/256.f,  4/256.f,  6/256.f,  4/256.f, 1/256.f
 };
 
-__global__ void gaussianBlurGlobal(const unsigned char* in, unsigned char* out, int w, int h) {
+// 高斯模糊 Kernel（同版本 A）
+__global__
+void gaussianBlurGlobal(const unsigned char* in, unsigned char* out, int w, int h) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    float sum = 0;
+    float sum = 0.0f;
     for (int ky = -2; ky <= 2; ++ky) {
         for (int kx = -2; kx <= 2; ++kx) {
             int ix = min(max(x + kx, 0), w - 1);
             int iy = min(max(y + ky, 0), h - 1);
-            sum += gaussKernel[(ky + 2) * 5 + (kx + 2)] * in[iy * w + ix];
+            sum += gaussKernel[(ky + 2)*5 + (kx + 2)] * in[iy * w + ix];
         }
     }
     out[y * w + x] = (unsigned char)sum;
 }
 
-__global__ void sobelGlobal(const unsigned char* in, unsigned char* out, int w, int h) {
+// Sobel Kernel（同版本 A）
+__global__
+void sobelGlobal(const unsigned char* in, unsigned char* out, int w, int h) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     int Gx = 0, Gy = 0;
-    int sx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
-    int sy[3][3] = {{ 1, 2, 1}, { 0, 0, 0}, {-1,-2,-1}};
+    int sx[3][3] = {{-1, 0, 1},
+                    {-2, 0, 2},
+                    {-1, 0, 1}};
+    int sy[3][3] = {{ 1,  2,  1},
+                    { 0,  0,  0},
+                    {-1, -2, -1}};
     for (int r = -1; r <= 1; ++r) {
         for (int c = -1; c <= 1; ++c) {
             int ix = min(max(x + c, 0), w - 1);
@@ -58,7 +90,7 @@ __global__ void sobelGlobal(const unsigned char* in, unsigned char* out, int w, 
     out[y * w + x] = (unsigned char)(val > 255 ? 255 : val);
 }
 
-// 檢查檔案是否存在
+// 檢查文件或目錄是否存在
 bool file_exists(const char* filename) {
     struct stat buffer;
     return (stat(filename, &buffer) == 0);
@@ -71,15 +103,19 @@ int main(int argc, char* argv[]) {
     }
     const char* input_video = argv[1];
 
-    // ──────────────────────────────────────────────
-    //  ** 在程式最前面打開一個 CSV 檔案 **
-    std::ofstream ofs;
-    ofs.open("timing.csv", std::ios::out);
+    // ------------------------------------------------------
+    // 1. 打開 CSV（truncate 模式），寫入表頭
+    std::ofstream ofs("timing.csv", std::ios::out);
     if (!ofs.is_open()) {
-        fprintf(stderr, "ERROR: 無法開啟 timing.csv\n");
+        fprintf(stderr, "ERROR: 無法打開 timing.csv\n");
         return -1;
     }
-    // CSV 表頭：新增了各傳輸階段的 bandwidth 欄位 (MB/s)
+    // CSV 欄：frame_id, elapsed_page_h2d_ms, bw_page_h2d_MBps,
+    //         elapsed_pin_h2d_ms,  bw_pin_h2d_MBps,
+    //         elapsed_kernels_ms,
+    //         elapsed_page_d2h_ms, bw_page_d2h_MBps,
+    //         elapsed_pin_d2h_ms,  bw_pin_d2h_MBps
+    //
     ofs << "frame_id,"
         << "elapsed_page_h2d_ms,bw_page_h2d_MBps,"
         << "elapsed_pin_h2d_ms,bw_pin_h2d_MBps,"
@@ -87,32 +123,38 @@ int main(int argc, char* argv[]) {
         << "elapsed_page_d2h_ms,bw_page_d2h_MBps,"
         << "elapsed_pin_d2h_ms,bw_pin_d2h_MBps\n";
     ofs << std::fixed << std::setprecision(3);
+    ofs.flush();  // 先把表頭刷到磁碟
 
-    // ──────────────────────────────────────────────
-    // 1. 用 ffmpeg 拆影格
+    // ------------------------------------------------------
+    // 2. 用 FFmpeg 拆幀到 frames/
     printf(">>> 正在呼叫 ffmpeg 拆影格 ...\n");
-    mkdir("frames", 0777);
+    if (mkdir("frames", 0777) && errno != EEXIST) {
+        perror("ERROR: mkdir frames 失敗");
+        ofs.close();
+        return -1;
+    }
     {
-        char buf[512];
-        snprintf(buf, sizeof(buf),
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
                  "ffmpeg -hide_banner -loglevel error -i %s -vsync 0 frames/frame_%%06d.png",
                  input_video);
-        int ret = system(buf);
+        int ret = system(cmd);
         if (ret != 0) {
-            fprintf(stderr, "ERROR: ffmpeg 拆影格失敗 (cmd: %s)\n", buf);
+            fprintf(stderr, "ERROR: ffmpeg 拆影格失敗 (cmd: %s)\n", cmd);
             ofs.close();
             return -1;
         }
     }
-    printf(">>> 拆影格完成，請到 `frames/` 資料夾確認 PNG 檔。\n");
+    printf(">>> 拆影格完成，請檢查 frames/ 下的 PNG 檔。\n");
 
     if (!file_exists("frames/frame_000001.png")) {
-        fprintf(stderr, "ERROR: 沒有在 frames/ 找到任何影格。\n");
+        fprintf(stderr, "ERROR: frames/ 下沒有找到任何影格。\n");
         ofs.close();
         return -1;
     }
 
-    // 2. 讀第一張影格取得解析度
+    // ------------------------------------------------------
+    // 3. 讀取第一張影格取得寬/高（灰階單通道）
     int IMG_W = 0, IMG_H = 0, channels = 0;
     unsigned char* dummy = stbi_load("frames/frame_000001.png", &IMG_W, &IMG_H, &channels, 1);
     if (!dummy) {
@@ -121,168 +163,142 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     stbi_image_free(dummy);
-    printf(">>> 影格解析度 = %dx%d (灰階單通道)\n", IMG_W, IMG_H);
+    printf(">>> 影格分辨率 = %dx%d (灰階單通道)\n", IMG_W, IMG_H);
 
+    // 計算每幀像素位元組數 & 總幀數
     size_t frame_bytes = IMG_W * IMG_H * sizeof(unsigned char);
     int max_frames = 0;
-    for (int i = 1;; ++i) {
+    for (int i = 1; ; ++i) {
         char fname[256];
         snprintf(fname, sizeof(fname), "frames/frame_%06d.png", i);
         if (!file_exists(fname)) break;
         ++max_frames;
     }
-    printf(">>> 總共在 frames/ 找到 %d 張影格。\n", max_frames);
+    printf(">>> frames/ 下共找到 %d 張影格。\n", max_frames);
     if (max_frames == 0) {
-        fprintf(stderr, "ERROR: 沒有任何影格可處理。\n");
+        fprintf(stderr, "ERROR: 沒有影格可處理。\n");
         ofs.close();
         return -1;
     }
 
-    // 3. 配置 Host 端的 pageable & pinned buffer
-    unsigned char* h_frame_pinned = nullptr;
-    cudaError_t err = cudaMallocHost((void**)&h_frame_pinned, frame_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ERROR: cudaMallocHost 失敗 (%s)\n", cudaGetErrorString(err));
-        ofs.close();
-        return -1;
-    }
-
-    // 4. 配置 Device 端 Buffer
+    // ------------------------------------------------------
+    // 4. 在 device 上配置 input/temp/output buffer
     unsigned char *d_in = nullptr, *d_tmp = nullptr, *d_out = nullptr;
     cudaMalloc((void**)&d_in,  frame_bytes);
     cudaMalloc((void**)&d_tmp, frame_bytes);
     cudaMalloc((void**)&d_out, frame_bytes);
 
-    // 5. 建立 CUDA Stream & cudaEvent
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    // 5. 為 kernel 測時準備兩個 event（只測 kernel 耗時）
     cudaEvent_t ev_start, ev_end;
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_end);
 
-    // 6. 決定 Block/ Grid
+    // 6. block & grid 大小
     dim3 block(16, 16);
     dim3 grid((IMG_W + block.x - 1) / block.x, (IMG_H + block.y - 1) / block.y);
 
-    // 7. 逐張讀、處理、寫檔並量測
-    mkdir("processed", 0777);
+    // ------------------------------------------------------
+    // 7. 逐幀處理
+    if (mkdir("processed", 0777) && errno != EEXIST) {
+        perror("ERROR: mkdir processed 失敗");
+        // 釋放資源
+        cudaFree(d_in); cudaFree(d_tmp); cudaFree(d_out);
+        ofs.close();
+        return -1;
+    }
+
     for (int fid = 1; fid <= max_frames; ++fid) {
         char in_name[256], out_name[256];
         snprintf(in_name,  sizeof(in_name),  "frames/frame_%06d.png", fid);
         snprintf(out_name, sizeof(out_name), "processed/processed_%06d.png", fid);
 
-        // 7.1 讀入影格 (pageable)
+        // 7.1 用 stbi_load 讀入灰階 PNG
         int w, h, c;
         unsigned char* ptr = stbi_load(in_name, &w, &h, &c, 1);
         if (!ptr) {
-            fprintf(stderr, "WARNING: stbi_load 讀取 %s 失敗，跳過這張\n", in_name);
+            fprintf(stderr, "WARNING: stbi_load 讀取 %s 失敗，跳過此幀\n", in_name);
+            // 這幀無法讀入，寫一行 ERROR_LOAD，然後 continue
+            ofs << fid << ","
+                << "ERROR_LOAD,N/A,"   // Pageable H2D
+                << "ERROR_LOAD,N/A,"   // Pinned  H2D
+                << "ERROR_LOAD,"       // kernels
+                << "ERROR_LOAD,N/A,"   // Pageable D2H
+                << "ERROR_LOAD,N/A\n"; // Pinned  D2H
+            ofs.flush();
             continue;
         }
-        // 7.2 複製到 pinned buffer
-        memcpy(h_frame_pinned, ptr, frame_bytes);
 
-        // 宣告變數存放每個階段的耗時 (毫秒)
-        float elapsed_page_h2d = 0.0f, elapsed_pin_h2d = 0.0f;
-        float elapsed_kernels   = 0.0f;
-        float elapsed_page_d2h = 0.0f, elapsed_pin_d2h = 0.0f;
+        // 7.2 同步 memcpy H2D（版本 A：只用 cudaMemcpy，不分 pinned/pageable，故這兩欄都寫 N/A）
+        cudaMemcpy(d_in, ptr, frame_bytes, cudaMemcpyHostToDevice);
 
-        // (a) Pageable H→D
-        cudaEventRecord(ev_start, stream);
-        cudaMemcpyAsync(d_in, ptr, frame_bytes, cudaMemcpyHostToDevice, stream);
-        cudaEventRecord(ev_end, stream);
-        cudaEventSynchronize(ev_end);
-        cudaEventElapsedTime(&elapsed_page_h2d, ev_start, ev_end);
-
-        // (b) Pinned H→D
-        cudaEventRecord(ev_start, stream);
-        cudaMemcpyAsync(d_in, h_frame_pinned, frame_bytes, cudaMemcpyHostToDevice, stream);
-        cudaEventRecord(ev_end, stream);
-        cudaEventSynchronize(ev_end);
-        cudaEventElapsedTime(&elapsed_pin_h2d, ev_start, ev_end);
-
-        // (c) 執行 kernel
-        cudaEventRecord(ev_start, stream);
-        gaussianBlurGlobal<<<grid, block, 0, stream>>>(d_in, d_tmp, IMG_W, IMG_H);
-        sobelGlobal     <<<grid, block, 0, stream>>>(d_tmp, d_out, IMG_W, IMG_H);
-        cudaEventRecord(ev_end, stream);
+        // 7.3 測量 kernel 耗時
+        float elapsed_kernels = 0.0f;
+        cudaEventRecord(ev_start, 0);
+        gaussianBlurGlobal<<<grid, block>>>(d_in, d_tmp, IMG_W, IMG_H);
+        sobelGlobal     <<<grid, block>>>(d_tmp, d_out, IMG_W, IMG_H);
+        cudaEventRecord(ev_end, 0);
         cudaEventSynchronize(ev_end);
         cudaEventElapsedTime(&elapsed_kernels, ev_start, ev_end);
 
-        // (d) Pageable D→H
-        cudaEventRecord(ev_start, stream);
-        cudaMemcpyAsync(ptr,    d_out, frame_bytes, cudaMemcpyDeviceToHost, stream);
-        cudaEventRecord(ev_end, stream);
-        cudaEventSynchronize(ev_end);
-        cudaEventElapsedTime(&elapsed_page_d2h, ev_start, ev_end);
+        // 7.4 同步 memcpy D2H
+        cudaMemcpy(ptr, d_out, frame_bytes, cudaMemcpyDeviceToHost);
 
-        // (e) Pinned D→H
-        cudaEventRecord(ev_start, stream);
-        cudaMemcpyAsync(h_frame_pinned, d_out, frame_bytes, cudaMemcpyDeviceToHost, stream);
-        cudaEventRecord(ev_end, stream);
-        cudaEventSynchronize(ev_end);
-        cudaEventElapsedTime(&elapsed_pin_d2h, ev_start, ev_end);
+        // 7.5 寫出 processed PNG
+        int write_ok = stbi_write_png(out_name, IMG_W, IMG_H, 1, ptr, IMG_W);
+        if (!write_ok) {
+            fprintf(stderr, "ERROR: 無法寫出 %s\n", out_name);
+            // 寫失敗也要向 CSV 報 ERROR_WRITE
+            ofs << fid << ","
+                << "N/A,N/A,"   // Pageable H2D
+                << "N/A,N/A,"   // Pinned  H2D
+                << "ERROR_WRITE," 
+                << "N/A,N/A,"   // Pageable D2H
+                << "N/A,N/A\n"; // Pinned  D2H
+            ofs.flush();
+            stbi_image_free(ptr);
+            continue;
+        }
 
-        // 把 pinned buffer 裡的資料複回 ptr，方便寫 PNG
-        memcpy(ptr, h_frame_pinned, frame_bytes);
-
-        // 7.4 用 stb_image_write 寫檔
-        stbi_write_png(out_name, IMG_W, IMG_H, 1, ptr, IMG_W);
-
-        // 7.5 計算帶寬 (MB/s)： frame_bytes / (elapsed_ms / 1000) ÷ (1024²)
-        float mb = frame_bytes / (1024.0f * 1024.0f);
-        float bw_page_h2d = mb / (elapsed_page_h2d / 1000.0f);
-        float bw_pin_h2d  = mb / (elapsed_pin_h2d  / 1000.0f);
-        float bw_page_d2h = mb / (elapsed_page_d2h / 1000.0f);
-        float bw_pin_d2h  = mb / (elapsed_pin_d2h  / 1000.0f);
-
-        // 7.6 釋放 stbi_load 的記憶體
-        stbi_image_free(ptr);
-
-        // 7.7 把這一幀的數據寫入 CSV
+        // 7.6 把這一幀各欄寫入 CSV，只有 kernel 測了時間，其它都寫 N/A
         ofs << fid << ","
-            << elapsed_page_h2d << "," << bw_page_h2d << ","
-            << elapsed_pin_h2d  << "," << bw_pin_h2d  << ","
-            << elapsed_kernels  << ","
-            << elapsed_page_d2h << "," << bw_page_d2h << ","
-            << elapsed_pin_d2h  << "," << bw_pin_d2h  << "\n";
+            << "N/A,N/A,"        // elapsed_page_h2d_ms, bw_page_h2d_MBps
+            << "N/A,N/A,"        // elapsed_pin_h2d_ms,  bw_pin_h2d_MBps
+            << elapsed_kernels << "," 
+            << "N/A,N/A,"        // elapsed_page_d2h_ms, bw_page_d2h_MBps
+            << "N/A,N/A\n";      // elapsed_pin_d2h_ms,  bw_pin_d2h_MBps
+        ofs.flush();
 
-        // 同步印到終端，方便觀察
-        printf("Frame %06d: H→D(page)=%.3fms (%.2fMB/s), H→D(pin)=%.3fms (%.2fMB/s) | "
-               "kernels=%.3fms | "
-               "D→H(page)=%.3fms (%.2fMB/s), D→H(pin)=%.3fms (%.2fMB/s)\n",
-               fid,
-               elapsed_page_h2d, bw_page_h2d,
-               elapsed_pin_h2d,  bw_pin_h2d,
-               elapsed_kernels,
-               elapsed_page_d2h, bw_page_d2h,
-               elapsed_pin_d2h,  bw_pin_d2h);
+        // 7.7 打印終端日誌
+        printf("Frame %06d: kernels=%.3fms\n", fid, elapsed_kernels);
+
+        stbi_image_free(ptr);
     }
 
+    // ------------------------------------------------------
     // 8. 釋放 CUDA 資源
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_end);
-    cudaStreamDestroy(stream);
     cudaFree(d_in);
     cudaFree(d_tmp);
     cudaFree(d_out);
-    cudaFreeHost(h_frame_pinned);
+    ofs.close();
 
-    // 9. 用 ffmpeg 把 processed/*.png 組回影片
+    // ------------------------------------------------------
+    // 9. 用 ffmpeg 合併 processed/*.png → output.mp4
     printf(">>> 正在呼叫 ffmpeg 合併影格成 output.mp4 ...\n");
     {
-        char buf2[512];
-        snprintf(buf2, sizeof(buf2),
-                 "ffmpeg -hide_banner -loglevel error -y -r 30 -start_number 1 -i processed/processed_%%06d.png -c:v mpeg4 -q:v 5 output.mp4");
-        int ret2 = system(buf2);
+        char cmd2[512];
+        snprintf(cmd2, sizeof(cmd2),
+                 "ffmpeg -hide_banner -loglevel error -y "
+                 "-r 30 -start_number 1 "
+                 "-i processed/processed_%%06d.png "
+                 "-c:v mpeg4 -q:v 5 output.mp4");
+        int ret2 = system(cmd2);
         if (ret2 != 0) {
-            fprintf(stderr, "ERROR: ffmpeg 合併影格失敗 (cmd: %s)\n", buf2);
-            ofs.close();
+            fprintf(stderr, "ERROR: ffmpeg 合併影格失敗 (cmd: %s)\n", cmd2);
             return -1;
         }
     }
-    printf(">>> 處理完成，輸出影片：output.mp4\n");
-
-    // 關閉 CSV 檔案
-    ofs.close();
+    printf(">>> 處理完成，生成 output.mp4\n");
     return 0;
 }
