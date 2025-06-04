@@ -1,26 +1,3 @@
-// test_vedio_simple.cu
-//
-// 純版本 A 風格：
-// - 拆 input.mp4 → frames/frame_XXXXXX.png
-// - 逐幀讀入灰階 PNG，用同步 cudaMemcpy + 兩個 kernel (Gaussian → Sobel)
-// - 僅測量 kernel 耗時，其它 H2D/D2H 寫入 N/A
-// - 寫入 timing.csv：若本版本不測某階段，則填 "N/A"
-// - 處理後輸出到 processed/processed_XXXXXX.png
-// - 最後合成 processed/*.png → output.mp4
-//
-// 編譯：
-//   nvcc -std=c++11 test_vedio_simple.cu -o test_vedio_simple
-//
-// 執行：
-//   ./test_vedio_simple input.mp4
-//
-// 產出：
-//   - frames/frame_000001.png, frame_000002.png, …
-//   - processed/processed_000001.png, processed/processed_000002.png, …
-//   - timing.csv
-//   - output.mp4
-//
-
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
